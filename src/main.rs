@@ -1,5 +1,7 @@
 
 
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Instant;
 use std::io::BufRead;
 use rand::Rng;
@@ -13,7 +15,7 @@ use clap::Parser;
 use std::path::PathBuf;
 use crate::io::{expand_dirs, read_pathbuf_to_mem, write_mem_to_pathbuf};
 use rayon::prelude::*;
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use indicatif::{ProgressBar, ProgressStyle};
 use tokenizers::tokenizer::{
     Tokenizer
 };
@@ -50,14 +52,14 @@ struct ArgParser {
 =================================================================*/
 
 
-fn build_pbar(num_items: usize, units: &str, mp: &MultiProgress) -> ProgressBar {
+fn build_pbar(num_items: usize, units: &str) -> ProgressBar {
     let mut template = String::from(units);
     template.push_str(" {human_pos}/{human_len} [{elapsed_precise}/{duration_precise}] [{wide_bar:.cyan/blue}]");
-    let pbar = mp.add(ProgressBar::new(num_items as u64)
+    let pbar = ProgressBar::new(num_items as u64)
         .with_style(
             ProgressStyle::with_template(&template).unwrap()
-        )
-    );
+        );
+
     pbar.inc(0);
     pbar
 }
@@ -68,11 +70,10 @@ fn build_pbar(num_items: usize, units: &str, mp: &MultiProgress) -> ProgressBar 
 =                             STAT COLLECTOR                      =
 =================================================================*/
 
-fn collect_stats(chunk: &Vec<PathBuf>, reservoir_size: usize, thread_num:usize, mp: &MultiProgress) -> Result<(Vec<usize>, usize, usize), Error> {
+fn collect_stats(chunk: &Vec<PathBuf>, reservoir_size: usize, thread_num:usize, pbar: Arc<Mutex<ProgressBar>>) -> Result<(Vec<usize>, usize, usize), Error> {
     let mut reservoir: Vec<usize> = Vec::new();
     let mut full_token_count = 0;
     let mut docs_seen = 0;
-    let pbar = build_pbar(chunk.len(), format!("(Thread {:?})", thread_num).as_str(), mp);
     let tokenizer = Tokenizer::from_pretrained("EleutherAI/gpt-neox-20b", None).unwrap();
     let mut rng = rand::thread_rng();
     for path in chunk {
@@ -95,7 +96,7 @@ fn collect_stats(chunk: &Vec<PathBuf>, reservoir_size: usize, thread_num:usize, 
             full_token_count += token_length;
             docs_seen += 1;
            }
-        pbar.inc(1);
+        pbar.lock().unwrap().inc(1);
     }
 
     Ok((reservoir, full_token_count, docs_seen))
@@ -120,14 +121,16 @@ fn main() {
 
 
     let paths = expand_dirs(args.input.clone(), None).unwrap();
+    let total_paths = paths.len();
+    let pbar = build_pbar(paths.len(), "Paths");
+    let pbar = Arc::new(Mutex::new(pbar));
     let threads = available_parallelism().unwrap().get();
     let chunk_size = (paths.len() + threads -1) / threads;
     let chunks: Vec<Vec<PathBuf>> = paths.chunks(chunk_size).map(|chunk| chunk.to_vec()).collect();
-    let mp = MultiProgress::new();
     let outputs: Vec<(Vec<usize>, usize, usize)> = chunks
         .par_iter()
         .enumerate()
-        .map(|(thread_num, chunk)| collect_stats(chunk, args.reservoir_size, thread_num, &mp).unwrap())
+        .map(|(thread_num, chunk)| collect_stats(chunk, args.reservoir_size, thread_num, pbar.clone()).unwrap())
         .collect();
 
 
