@@ -70,14 +70,20 @@ fn build_pbar(num_items: usize, units: &str) -> ProgressBar {
 =                             STAT COLLECTOR                      =
 =================================================================*/
 
-fn collect_stats(chunk: &Vec<PathBuf>, reservoir_size: usize, thread_num:usize, pbar: Arc<Mutex<ProgressBar>>) -> Result<(Vec<usize>, usize, usize), Error> {
+fn collect_stats(paths: Arc<Mutex<Vec<PathBuf>>>, reservoir_size: usize, pbar: Arc<Mutex<ProgressBar>>) -> Result<(Vec<usize>, usize, usize), Error> {
     let mut reservoir: Vec<usize> = Vec::new();
     let mut full_token_count = 0;
     let mut docs_seen = 0;
     let tokenizer = Tokenizer::from_pretrained("EleutherAI/gpt-neox-20b", None).unwrap();
     let mut rng = rand::thread_rng();
-    for path in chunk {
-        let contents = read_pathbuf_to_mem(path).unwrap();
+
+    loop {
+        let res = paths.lock().unwrap().pop().clone(); 
+        if res.is_none() {
+            break;
+        }
+        let path = res.unwrap();
+        let contents = read_pathbuf_to_mem(&path).unwrap();
         for line in contents.lines() {
             let line = line.unwrap();
             let json: Value = serde_json::from_str(&line).unwrap();
@@ -121,17 +127,19 @@ fn main() {
 
 
     let paths = expand_dirs(args.input.clone(), None).unwrap();
-    let total_paths = paths.len();
     let pbar = build_pbar(paths.len(), "Paths");
     let pbar = Arc::new(Mutex::new(pbar));
-    let threads = available_parallelism().unwrap().get();
-    let chunk_size = (paths.len() + threads -1) / threads;
-    let chunks: Vec<Vec<PathBuf>> = paths.chunks(chunk_size).map(|chunk| chunk.to_vec()).collect();
-    let outputs: Vec<(Vec<usize>, usize, usize)> = chunks
-        .par_iter()
-        .enumerate()
-        .map(|(thread_num, chunk)| collect_stats(chunk, args.reservoir_size, thread_num, pbar.clone()).unwrap())
-        .collect();
+    let num_threads = if args.threads == 0 {
+        available_parallelism().unwrap().get()   
+    } else {
+        args.threads
+    };
+
+    let paths = Arc::new(Mutex::new(paths));
+    let threads : Vec<usize> = (0..num_threads).collect();
+    let outputs : Vec<(Vec<usize>, usize, usize)> = threads.par_iter()
+        .map(|_| collect_stats(paths.clone(), args.reservoir_size, pbar.clone()).unwrap())
+        .collect(); 
 
 
     let total_tokens = outputs.iter().map(|(_, t,_)| t).sum::<usize>();
@@ -139,8 +147,7 @@ fn main() {
 
     let mut all_reservoirs: Vec<usize> = outputs.into_iter().flat_map(|(v, _, _)| v).collect();
     all_reservoirs.par_sort();
-    let total = all_reservoirs.iter().sum::<usize>();
-    let avg_tokens = total as f64 / all_reservoirs.len() as f64;
+    let avg_tokens = total_tokens as f64 / total_docs as f64;
     let median_tokens = all_reservoirs[all_reservoirs.len() / 2];
 
 
