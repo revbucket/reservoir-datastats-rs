@@ -70,42 +70,27 @@ fn build_pbar(num_items: usize, units: &str) -> ProgressBar {
 =                             STAT COLLECTOR                      =
 =================================================================*/
 
-fn collect_stats(paths: Arc<Mutex<Vec<PathBuf>>>, reservoir_size: usize, pbar: Arc<Mutex<ProgressBar>>) -> Result<(Vec<usize>, usize, usize), Error> {
-    let mut reservoir: Vec<usize> = Vec::new();
+fn collect_path_counts(path: &PathBuf) -> Result<(PathBuf, usize, usize, Vec<usize>), Error> {
+    // Given input pathbuf returns (path, total_documents, total_tokens, tokens_per_document)
     let mut full_token_count = 0;
     let mut docs_seen = 0;
+    let mut tokens_per_doc: Vec<usize> = Vec::new();
     let tokenizer = Tokenizer::from_pretrained("EleutherAI/gpt-neox-20b", None).unwrap();
-    let mut rng = rand::thread_rng();
 
-    loop {
-        let res = paths.lock().unwrap().pop().clone(); 
-        if res.is_none() {
-            break;
-        }
-        let path = res.unwrap();
-        let contents = read_pathbuf_to_mem(&path).unwrap();
-        for line in contents.lines() {
-            let line = line.unwrap();
-            let json: Value = serde_json::from_str(&line).unwrap();
-            let text = json["text"].as_str().unwrap();
-            let encoded = tokenizer.encode(text, false).unwrap();
-            let token_length = encoded.get_ids().to_vec().len();
+    let contents = read_pathbuf_to_mem(path).unwrap();
 
-            if docs_seen < reservoir_size {
-                reservoir.push(token_length);
-            } else {
-                let j = rng.gen_range(0..=docs_seen);
-                if j < reservoir_size {
-                    reservoir[j] = token_length;
-                }
-            }
-            full_token_count += token_length;
-            docs_seen += 1;
-           }
-        pbar.lock().unwrap().inc(1);
+    for line in contents.lines() {
+        let line = line.unwrap();
+        let json: Value = serde_json::from_str(&line).unwrap();
+        let text = json["text"].as_str().unwrap();
+        let encoded = tokenizer.encode(text, false).unwrap();
+        let token_length = encoded.get_ids().to_vec().len();
+        tokens_per_doc.push(token_length);
+        full_token_count += token_length;
+        docs_seen += 1;
     }
 
-    Ok((reservoir, full_token_count, docs_seen))
+    Ok((path.clone(), docs_seen, full_token_count, tokens_per_doc))
 }
 
 
@@ -115,10 +100,7 @@ fn collect_stats(paths: Arc<Mutex<Vec<PathBuf>>>, reservoir_size: usize, pbar: A
 
 #[derive(Serialize)]
 struct StatsResult {
-    total_tokens: usize,
-    total_docs: usize,
-    avg_tokens: f64,
-    median_tokens: usize
+    stats : Vec<(PathBuf, usize, usize, Vec<usize>)>
 }
 
 fn main() {
@@ -128,38 +110,21 @@ fn main() {
 
     let paths = expand_dirs(args.input.clone(), None).unwrap();
     let pbar = build_pbar(paths.len(), "Paths");
-    let pbar = Arc::new(Mutex::new(pbar));
-    let num_threads = if args.threads == 0 {
-        available_parallelism().unwrap().get()   
-    } else {
-        args.threads
-    };
 
-    let paths = Arc::new(Mutex::new(paths));
-    let threads : Vec<usize> = (0..num_threads).collect();
-    let outputs : Vec<(Vec<usize>, usize, usize)> = threads.par_iter()
-        .map(|_| collect_stats(paths.clone(), args.reservoir_size, pbar.clone()).unwrap())
-        .collect(); 
+    let outputs : Vec<(PathBuf, usize, usize, Vec<usize>)> = paths.par_iter()
+        .map(|p| {
+            let result = collect_path_counts(p).unwrap();
+            pbar.inc(1);
+            result 
+        })
+        .collect();
 
-
-    let total_tokens = outputs.iter().map(|(_, t,_)| t).sum::<usize>();
-    let total_docs = outputs.iter().map(|(_, _, d)| d).sum::<usize>();
-
-    let mut all_reservoirs: Vec<usize> = outputs.into_iter().flat_map(|(v, _, _)| v).collect();
-    all_reservoirs.par_sort();
-    let avg_tokens = total_tokens as f64 / total_docs as f64;
-    let median_tokens = all_reservoirs[all_reservoirs.len() / 2];
-
-
-    let result = StatsResult { total_tokens, total_docs, avg_tokens, median_tokens};
+    let result = StatsResult { stats: outputs };
     let json_bytes: Vec<u8> = serde_json::to_vec(&result).unwrap();
     write_mem_to_pathbuf(&json_bytes, &args.output).unwrap();
 
 
     println!("-------------------------");
     println!("Finishing stats collection in {:?} seconds", start_main.elapsed().as_secs());
-    println!("Processed {:?} total tokens", total_tokens);
-    println!("Processed {:?} total docs", total_docs);
-    println!("Median token length is {:?}", median_tokens);
-    println!("Average token length is {:?}", avg_tokens);
+
 }
