@@ -70,11 +70,10 @@ fn build_pbar(num_items: usize, units: &str) -> ProgressBar {
 =                             STAT COLLECTOR                      =
 =================================================================*/
 
-fn collect_path_counts(path: &PathBuf) -> Result<(PathBuf, usize, usize, Vec<usize>), Error> {
-    // Given input pathbuf returns (path, total_documents, total_tokens, tokens_per_document)
+fn collect_path_counts(path: &PathBuf) -> Result<(PathBuf, usize, usize), Error> {
+    // Given input pathbuf returns (path, total_documents, total_tokens)
     let mut full_token_count = 0;
     let mut docs_seen = 0;
-    let mut tokens_per_doc: Vec<usize> = Vec::new();
     let tokenizer = Tokenizer::from_pretrained("EleutherAI/gpt-neox-20b", None).unwrap();
 
     let contents = read_pathbuf_to_mem(path).unwrap();
@@ -85,12 +84,11 @@ fn collect_path_counts(path: &PathBuf) -> Result<(PathBuf, usize, usize, Vec<usi
         let text = json["text"].as_str().unwrap();
         let encoded = tokenizer.encode(text, false).unwrap();
         let token_length = encoded.get_ids().to_vec().len();
-        tokens_per_doc.push(token_length);
         full_token_count += token_length;
         docs_seen += 1;
     }
 
-    Ok((path.clone(), docs_seen, full_token_count, tokens_per_doc))
+    Ok((path.clone(), docs_seen, full_token_count))
 }
 
 
@@ -100,7 +98,7 @@ fn collect_path_counts(path: &PathBuf) -> Result<(PathBuf, usize, usize, Vec<usi
 
 #[derive(Serialize)]
 struct StatsResult {
-    stats : Vec<(PathBuf, usize, usize, Vec<usize>)>
+    stats : Vec<(PathBuf, usize, usize)>
 }
 
 fn main() {
@@ -111,7 +109,7 @@ fn main() {
     let paths = expand_dirs(args.input.clone(), None).unwrap();
     let pbar = build_pbar(paths.len(), "Paths");
 
-    let outputs : Vec<(PathBuf, usize, usize, Vec<usize>)> = paths.par_iter()
+    let outputs : Vec<(PathBuf, usize, usize)> = paths.par_iter()
         .map(|p| {
             let result = collect_path_counts(p).unwrap();
             pbar.inc(1);
