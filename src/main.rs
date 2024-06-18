@@ -1,28 +1,30 @@
 
 
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::collections::HashMap;
+use unicode_segmentation::UnicodeSegmentation;
+
+
 use std::time::Instant;
 use std::io::BufRead;
-use rand::Rng;
+
 use serde::Serialize;
 use serde_json;
 
 use serde_json::Value;
 use anyhow::Error;
-use std::thread::available_parallelism;
+
 use clap::Parser;
 use std::path::PathBuf;
 use crate::io::{expand_dirs, read_pathbuf_to_mem, write_mem_to_pathbuf};
 use rayon::prelude::*;
 use indicatif::{ProgressBar, ProgressStyle};
-use tokenizers::tokenizer::{
-    Tokenizer
-};
+
+use dashmap::DashMap;
 
 pub mod s3;
 pub mod io;
 
+const DELVE: [&str; 8] = ["delve", "delves", "delved", "delving", "Delve", "Delves", "Delved", "Delving"];
 
 /*=================================================================
 =                                  ARGS                           =
@@ -65,30 +67,50 @@ fn build_pbar(num_items: usize, units: &str) -> ProgressBar {
 }
 
 
+fn tokenize(s: &str) -> impl Iterator<Item = &str> {
+    s.split_word_bounds().filter(|w| {
+        for c in w.chars() {
+            if !c.is_whitespace() {
+                return true;
+            }
+        }
+        false
+    })
+}
+
 
 /*=================================================================
 =                             STAT COLLECTOR                      =
 =================================================================*/
 
-fn collect_path_counts(path: &PathBuf) -> Result<(PathBuf, usize, usize), Error> {
+fn collect_path_counts(path: &PathBuf, delve_counter: &DashMap<String, usize>) -> Result<(usize, usize), Error> {
     // Given input pathbuf returns (path, total_documents, total_tokens)
-    let mut full_token_count = 0;
+    let mut full_byte_length = 0;
     let mut docs_seen = 0;
-    let tokenizer = Tokenizer::from_pretrained("EleutherAI/gpt-neox-20b", None).unwrap();
 
     let contents = read_pathbuf_to_mem(path).unwrap();
-
     for line in contents.lines() {
         let line = line.unwrap();
         let json: Value = serde_json::from_str(&line).unwrap();
         let text = json["text"].as_str().unwrap();
-        let encoded = tokenizer.encode(text, false).unwrap();
-        let token_length = encoded.get_ids().to_vec().len();
-        full_token_count += token_length;
+        full_byte_length += text.len();
+        for token in tokenize(text) {
+            let token = token.trim();
+
+            for allomorph in DELVE {
+                if allomorph == token {
+                    delve_counter.entry(allomorph.to_string()).or_insert(0);
+                    delve_counter.alter(allomorph, |_, count| {
+                        count + 1
+                    })
+                }
+            }
+
+        }
         docs_seen += 1;
     }
 
-    Ok((path.clone(), docs_seen, full_token_count))
+    Ok((docs_seen, full_byte_length))
 }
 
 
@@ -98,7 +120,9 @@ fn collect_path_counts(path: &PathBuf) -> Result<(PathBuf, usize, usize), Error>
 
 #[derive(Serialize)]
 struct StatsResult {
-    stats : Vec<(PathBuf, usize, usize)>
+    stats : Vec<(usize, usize)>,
+    delve_counter: HashMap<String, usize>
+
 }
 
 fn main() {
@@ -109,20 +133,29 @@ fn main() {
     let paths = expand_dirs(args.input.clone(), None).unwrap();
     let pbar = build_pbar(paths.len(), "Paths");
 
-    let outputs : Vec<(PathBuf, usize, usize)> = paths.par_iter()
+    let delve_counter: DashMap<String, usize> = DashMap::new();
+    let outputs : Vec<(usize, usize)> = paths.par_iter()
         .map(|p| {
-            let result = collect_path_counts(p).unwrap();
+            let result = collect_path_counts(p, &delve_counter).unwrap();
             pbar.inc(1);
             result 
         })
         .collect();
 
-    let result = StatsResult { stats: outputs };
+    let delve_counter_hmap: HashMap<String, usize> = delve_counter.clone().into_iter().collect();        
+    let total_docs : usize = outputs.iter().map(|(d, _)| d).sum();
+    let total_bytes : usize = outputs.iter().map(|(_,b)| b).sum();
+
+    let result = StatsResult { stats: outputs , delve_counter: delve_counter_hmap};
     let json_bytes: Vec<u8> = serde_json::to_vec(&result).unwrap();
     write_mem_to_pathbuf(&json_bytes, &args.output).unwrap();
 
 
+
     println!("-------------------------");
+    println!("Saw {:?} bytes of data", total_bytes);
+    println!("Saw {:?} docs", total_docs);
+    println!("Delve counts {:?}", delve_counter);
     println!("Finishing stats collection in {:?} seconds", start_main.elapsed().as_secs());
 
 }
